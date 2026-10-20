@@ -27,6 +27,69 @@ from tools.connectors import CONNECTOR_BATCH_SENTINEL, is_connector_name
 from tools.connectors.search import connections_in_scope, connector_entries_by_group, remote_schemas_for
 
 logger = logging.getLogger("tools.tool_search")
+
+# ---------------------------------------------------------------------------
+# LACVON policy filter — per-tool authorization for tool_search results.
+# Loads the policy JSON (if readable) and filters the catalog so the model
+# only sees tools it is authorized to invoke.  Falls back to unfiltered
+# results if the policy is unavailable (the gate still enforces authorization
+# at execution time via tool_call).
+# ---------------------------------------------------------------------------
+import os as _os
+_POLICY_FILTER_CACHE: Optional[Dict[str, Any]] = None
+
+def _load_lacvon_policy() -> Optional[Dict[str, Any]]:
+    global _POLICY_FILTER_CACHE
+    if _POLICY_FILTER_CACHE is not None:
+        return _POLICY_FILTER_CACHE
+    path = _os.environ.get("TRANSIQ_CC_POLICY") or _os.environ.get("HERMES_POLICY_PATH")
+    if not path:
+        _POLICY_FILTER_CACHE = {}
+        return _POLICY_FILTER_CACHE
+    try:
+        with open(path, "r", encoding="utf-8") as _fh:
+            _POLICY_FILTER_CACHE = json.load(_fh)
+    except Exception:
+        _POLICY_FILTER_CACHE = {}
+    return _POLICY_FILTER_CACHE
+
+def _is_tool_allowed_by_policy(tool_name: str, agent: str) -> bool:
+    """Return True if the policy allows the tool for the agent.
+    Returns None (unknown) if the policy is unavailable or the tool is not
+    matched by any rule — the gate is the authoritative check."""
+    doc = _load_lacvon_policy()
+    if not doc:
+        return None  # policy unavailable — fail open for discovery
+    default_effect = str(doc.get("default_effect", "allow")).lower()
+    agents_section = doc.get("agents", {})
+    agent_rules = agents_section.get(agent, [])
+    global_rules = doc.get("global_rules", [])
+    all_rules = list(agent_rules) + list(global_rules)
+    deny_rules = []
+    allow_rules = []
+    import re as _re
+    for rule in all_rules:
+        match = rule.get("match", {})
+        tool_re_str = match.get("tool") or match.get("tool_pattern")
+        if not tool_re_str:
+            continue
+        try:
+            if not _re.search(tool_re_str, tool_name):
+                continue
+        except re.error:
+            continue
+        effect = str(rule.get("effect", "deny")).lower()
+        if effect == "deny":
+            deny_rules.append(rule)
+        elif effect == "allow":
+            allow_rules.append(rule)
+    if deny_rules:
+        return False
+    if allow_rules:
+        return True
+    return default_effect == "allow"
+
+
 # Bound the work one bridge call requests. Search is capped at the gateway's
 # own limit: the connector search route answers 7 use_cases per request and
 # returns HTTP 502 for 8 or more (measured 2026-09-09), and one local call
@@ -455,10 +518,16 @@ def dispatch_tool_search(args: Dict[str, Any], *, current_tool_defs: List[Dict[s
     results: List[Dict[str, Any]] = []
     tools_map: Dict[str, Dict[str, Any]] = {}
     available_sources = _available_source_summary(catalog) if catalog else []
+    # Determine the current agent for policy filtering
+    _agent = _os.environ.get("HERMES_PROFILE") or _os.environ.get("HERMES_PROFILE_NAME") or "unknown"
     for position, query in enumerate(queries):
         corpus = catalog + remote_entries[position]
         hits = search_catalog(corpus, query, limit=limit)
         for h in hits:
+            # Policy filter: skip tools the agent is not authorized to discover
+            _allowed = _is_tool_allowed_by_policy(h.name, _agent)
+            if _allowed is False:
+                continue
             tools_map.setdefault(h.name, _shared_tool_record(h))
         matches = [h.name for h in hits]
         group: Dict[str, Any] = {"query": query, "matches": matches}
@@ -494,10 +563,15 @@ def dispatch_tool_describe(args: Dict[str, Any], *, current_tool_defs: List[Dict
     tools: Dict[str, Dict[str, Any]] = {}
     not_found: List[str] = []
     errors: Dict[str, str] = {}
+    _agent_desc = _os.environ.get("HERMES_PROFILE") or _os.environ.get("HERMES_PROFILE_NAME") or "unknown"
     for name in names:
         fn = by_name.get(name)
         remote_fn = remote_schemas.get(name)
         if fn is not None:
+            _allowed = _is_tool_allowed_by_policy(name, _agent_desc)
+            if _allowed is False:
+                not_found.append(name)
+                continue
             tools[name] = {"description": fn.get("description", ""),
                            "parameters": fn.get("parameters", {})}
         elif isinstance(remote_fn, dict):
