@@ -395,8 +395,15 @@ def _unwrap_tool_search_call(
         if function_name != _ts.TOOL_CALL_NAME:
             return function_name, function_args, None
         underlying, underlying_args, err = _ts.resolve_underlying_call(function_args)
-        if err or not underlying:
-            return function_name, function_args, None
+        if err:
+            # The bridge already knows why this call is invalid. Surface that
+            # error before hooks see the synthetic tool_call wrapper as a tool
+            # name (and misleadingly report a policy denial).
+            return function_name, function_args, err
+        if not underlying:
+            return function_name, function_args, (
+                "tool_call did not resolve to an executable tool."
+            )
         if underlying == _ts.CONNECTOR_BATCH_SENTINEL:
             # Both executors retain the wrapper: scope/probe/hooks run per entry
             # in the batch dispatcher, not against a synthetic registry name.
@@ -418,7 +425,10 @@ def _unwrap_tool_search_call(
                 f"{probe.get('hint', '')}"
             ).strip()
     except Exception:
-        pass
+        logger.exception("Failed to unwrap deferred tool_call before policy hooks")
+        return function_name, function_args, (
+            "tool_call could not be resolved safely; no tool was executed."
+        )
     return function_name, function_args, scope_block
 
 
