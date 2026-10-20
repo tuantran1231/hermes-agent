@@ -62,15 +62,17 @@ def _is_tool_allowed_by_policy(tool_name: str, agent: str) -> bool:
         return None  # policy unavailable — fail open for discovery
     default_effect = str(doc.get("default_effect", "allow")).lower()
     agents_section = doc.get("agents", {})
-    agent_rules = agents_section.get(agent, [])
+    agent_rules = agents_section.get(agent, {}).get("rules", [])
     global_rules = doc.get("global_rules", [])
     all_rules = list(agent_rules) + list(global_rules)
     deny_rules = []
     allow_rules = []
     import re as _re
     for rule in all_rules:
+        if not isinstance(rule, dict):
+            continue
         match = rule.get("match", {})
-        tool_re_str = match.get("tool") or match.get("tool_pattern")
+        tool_re_str = (match.get("tool") or match.get("tool_pattern") or "").strip()
         if not tool_re_str:
             continue
         try:
